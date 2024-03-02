@@ -1,30 +1,10 @@
-// This code is based off of the  code for a BIOE123 centrifuge (version 1b)
-//  
-// Key elements:
-//
-//  - set the motor speed based on user input
-//  - read phototransistor votlage signals
-//  - allow user to set time duration
-//  - allow user to emergency "brake" 
-//
-//  The averaging code is based on code by by David A. Mellis  <dam@mellis.org> and by Tom Igoe
-//  The encoder code is by Ethan Li
-//  The rest is by Ross Venook; 04NOV2020 & 16JAN2023
-
-//
+// define ON and OFF as two states
+enum State {ON, OFF};
+State state = OFF;
 
 //define constants and pins
-//const int MPU_ADDR = 0x68; // I2C address of the MPU-6050. If AD0 pin is set to HIGH, the I2C address will be 0x69.
 int motor_gate_pin = 5; // sends certain PWM to mosfet to control motor
 int comparator_pin = 2; // recieves voltage signal information from comparator
-int LED_power_pin = 14; // otherwise known as pin A0, simply powers LED
-int comparator_ref_pin = 18; // otherwise known as pin A4, simply provides volatage to resistor divide to give specific Vref for comparator
-int phototransistor_pin = 19; // otherwise known as pin A5, simply sends some current to establish voltage drop over phototransistor
-
-//define encoder variables
-// "interrupts" = receive that D2 is high when an event happens,
-// micro will check what happens after each interrupt
-// and execute an interrupt routine for that pin
 
 volatile int comparator_counter = 0; // counter, needs to be declared volatile
 // so compiler won't optimize the incrementing line out of the compiled program
@@ -32,25 +12,35 @@ volatile int comparator_counter = 0; // counter, needs to be declared volatile
 // counter is interrupt-safe
 
 int comparator_counter_previous = 0;
-unsigned long current_time = 0; // time--> calls millis() which gives milliseconds since last reset
+float current_time = 0; // time--> calls millis() which gives milliseconds since last reset
 // check out elapsedmillis library for timing purposes
-
-unsigned long comparator_time = 0; // current time
-unsigned long comparator_time_previous = 0; // last time we reported the speed (# interrupts/time passed)
-unsigned long comparator_time_delta = 0; // encoder_time - encoder_time_previous
+ 
+float comparator_time = 0; // current time
+float comparator_time_previous = 0; // last time we reported the speed (# interrupts/time passed)
+float comparator_time_delta = 0; // encoder_time - encoder_time_previous
 
 // scaling factor from counts to rpm of motor (with gears taken into account)
-int counts_per_rev = 12*120; // expected number of interrupts per revolution based on pololu motor gear/encoder
-int comparator_sample_interval = 100; //how long (in ms) we wait before checking speed 
+int comparator_sample_interval = 1000; //how long (in ms) we wait before checking speed 
 
 //define variables
 //analog input + pwm variables
-int duration = 0;
-int write_duty = 0; // duty cycle to send to mosfet to run motor (PWM)
+float duration = 0;
+float start_time = 0;
+float write_duty = 55; // duty cycle to send to mosfet to run motor (PWM)
+float frequency = 0;
 float angular_velocity = 0;
+float PPR = 2;
+
+float set_RPM = 0;
+float measured_RPM = 0;
+float new_RPM = 0;
+float error = 0;
+float max_RPM = 1648;
+
+float Kp = 0.015;
+float k = 0;
 
 char tmp_str[7]; // temporary variable used in convert function
-
 
 //interrupt service routine
 // quick, called after each interrupt signal
@@ -60,61 +50,92 @@ void comparatorInterruptHandler() {
 
 void setup() {
   pinMode(motor_gate_pin, OUTPUT);
-  pinMode(comparator_power_pin, OUTPUT);
-  pinMode(LED_power_pin, OUTPUT);
-  pinMode(encoder_pin, INPUT_PULLUP); // must be on pullup because encoder stays floating (locked at 5 from arduino) unless sensor is triggered (allows pin to be pulled down to 0)
+  // pinMode(comparator_power_pin, OUTPUT);
+  // pinMode(LED_power_pin, OUTPUT);
+  pinMode(comparator_pin, INPUT_PULLUP); // must be on pullup because encoder stays floating (locked at 5 from arduino) unless sensor is triggered (allows pin to be pulled down to 0)
   
   Serial.begin(9600);
   while (!Serial);  // wait until the serial monitor is open before proceeding
-  Serial.println("Please enter desired motor speed (integer sets PWM between 0 and 255): ");
+  Serial.println("Please enter desired motor speed in RPM: ");
 
-  attachInterrupt(digitalPinToInterrupt(encoder_pin),motorEncoderInterruptHandler,CHANGE); //watches for any change in encoder_pin (use 12 in scaling factor), 6 in scaling factor for rising edge or falling edge only
+  attachInterrupt(digitalPinToInterrupt(comparator_pin),comparatorInterruptHandler,RISING); // triggered when every 
   current_time = millis();
 }
 
 void loop() {
-  // power LED:
-  analogWrite(LED_power_pin, 255);
-  // create Vref voltage:
-  anaglogWrite(comparator_ref_pin, 255);
-  // create phototransistor voltage:
-  analogWrite(phototransistor_pin, 255);
-  // get input from Serial monitor to set duty cycle
-  //while (Serial.available() == 0) {
-  //}
-  if(Serial.available()>0){
-    //write_duty = Serial.read();
-    write_duty = Serial.parseInt();
-    Serial.println("Enter time duration in seconds: ")
-    duration = Serial.parseInt()
-    Serial.println((String)"Time duration "+duration+" seconds long");
+  if (state == OFF) {
+    analogWrite(motor_gate_pin, 0);
+    if(Serial.available()>0){
+      set_RPM = Serial.parseInt();
+      Serial.println((String)"Target RPM: "+set_RPM);
+      Serial.println((String)"Enter desired centrifugation time in seconds: ");
+      while (Serial.available()==0);
+      duration = Serial.parseInt();
+      Serial.println((String)"Centrifugation time: "+duration+" seconds");
+      duration *= 1000; // convert to millis
+      start_time = millis();
+      state = ON; // now turned on!
+    } else {
+      Serial.println("Please enter desired motor speed in RPM: ");
+      while (Serial.available()==0);
+    }
+  }
+  if (state == ON) {
+    current_time = millis();
+    if ((current_time - start_time) > duration) {
+      analogWrite(motor_gate_pin, 0);
+      Serial.println("Centrifugation period finished. Ramp down initiated.");
+      float comparator_counter_current = comparator_counter;
+      delay(100);
+      while (comparator_counter > comparator_counter_current) {
+        comparator_counter_current = comparator_counter;
+        delay(100);
+      }
+      Serial.println("Ramp down completed. Thank you for using our centrifuge!");
+      state = OFF;
+    }
+    
+    new_RPM = set_RPM;
+    if (measured_RPM > 0) { // only starts reading this code once centrifugation starts
+      error = set_RPM - measured_RPM;
+      if (error > 0) {
+        k = -(error*Kp);
+      } else if (error < 0) {
+        k = (error*Kp);
+      } else if (error = 0) {
+        k = 0;
+      }
+      new_RPM += k;
+    }
+    Serial.println((String)"new RPM: "+new_RPM);
+    write_duty = (new_RPM/max_RPM)*255;
     analogWrite(motor_gate_pin, write_duty);
     Serial.println((String)"Duty cycle set to: "+write_duty);
-    Serial.println("Hit enter key for emergency stop");
-    //Serial.println("Enter another integer (PWM between 0 and 255) to change speed: ");     
-  }
 
-// get time
-unsigned long new_current_time = millis();
+    unsigned long new_current_time = millis();
+    // tachnometer frequency formula: f = # pulses / time passed
+    // the number of pulses is tracked by the comparator_counter variable
+    // the time passed will be about the same everytime, determined by the comparator_sample_interval global variable
+    comparator_time_delta = new_current_time - comparator_time_previous; // this value will be the "time passed"
+    if (comparator_time_delta > comparator_sample_interval) {
+      float comparator_counter_current = comparator_counter;
+      float comparator_counter_delta = comparator_counter_current - comparator_counter_previous; // this value will be the "# pulses"
+      float time_passed = comparator_time_delta / 1000; // to convert to seconds
+      frequency = comparator_counter_delta / time_passed; // this value is "f"
 
-// update comparator value and calculate speed
-  comparator_time_delta = new_current_time - comparator_time_previous;
-  if (comparator_time_delta > comparator_sample_interval) {
-    unsigned long comparator_counter_current = comparator_counter;
-    unsigned long comparator_counter_delta = copmarator_counter_current - comparator_counter_previous;
-    // do something to divide it by 2??? because two protrustions
-    angular_velocity = 60.0 * 1000 * comparator_counter_delta / counts_per_rev / comparator_time_delta; // rpm
-    comparator_counter_previous = comparator_counter_current;
-    comparater_time_previous = new_current_time;
-    Serial.println((String)"Ang. Vel.: "+angular_velocity);
-    Serial.println((String)"PWM Value: "+write_duty);
-  }
-  current_time = new_current_time;
+      // tachometer frequency (f) to RPM formula: RPM = (f * 60) / PPR
+      // where PPR = pulses per revolution
+      // in the case of our centrifuge, the PPR = 2, because there are 2 light blockers, meaning that there will be two "pulses" per revolution
+      angular_velocity = (frequency*60) / PPR;
+      // angular_velocity = 60.0 * 1000 * comparator_counter_delta / counts_per_rev / comparator_time_delta; // rpm
+      comparator_counter_previous = comparator_counter_current;
+      comparator_time_previous = new_current_time;
+      Serial.println((String)"Ang. Vel.: "+angular_velocity);
+      Serial.println((String)"comparator counter delta: "+comparator_counter_delta);
 
-  if (current_time >= duration) {
-    // make motor stop when time duration reached
-    analogWrite(motor_gate_pin, 0);
-    Serial.pringln((String)duration+" seconds passed, centrifugation complete.");
-    Serial.println("Please enter desired motor speed (integer sets PWM between 0 and 255): ");
+      measured_RPM = angular_velocity;
+      Serial.println((String)"Measured RPM: "+measured_RPM);
+    }
+    current_time = new_current_time;
   }
 }
